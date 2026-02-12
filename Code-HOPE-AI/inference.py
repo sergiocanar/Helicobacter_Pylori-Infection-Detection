@@ -1,38 +1,48 @@
 import os
-import numpy as np
-import sys
-import cv2
 import torch
-import torch.nn as nn
-import torch.cuda as cuda
-import torch.nn.functional as F
-from datetime import datetime
-import json
-import pandas as pd
-from lib.pvtv2_lstm import LSTMModel
+import argparse
+from os.path import join as path_join
+
 from lib.admil import CenterLoss
+from lib.pvtv2_lstm import LSTMModel
 
 from utils.utils import inference_preprocess, inference_one_bag
 
 if __name__ == '__main__':
-
-  # model load
-  weight_path = '/mnt/data/yizhenyu/data/HP识别/workspace/MIL-HP_YZY_BACKUP/weights'
   
-  model = LSTMModel()
+  parser = argparse.ArgumentParser(description="HOPE AI inference parser")
+  parser.add_argument("--case", 
+                            type=str,
+                            default="Negative_1"
+                          )
+  
+  args = parser.parse_args()
+  
+  
+  this_dir = os.path.dirname(os.path.abspath(__file__))
+  weight_path = path_join(this_dir, "weights")
+  model_weights_path = path_join(weight_path, "model.pth")
+  center_loss_weight_path = path_join(weight_path, "center_loss.pth")
+  center_loss_img_weight_path = path_join(weight_path, "center_loss_img.pth")  
+  
+  # Model Loading...
+  #Model initiazation
+  model = LSTMModel() #LSTM
   model_center_loss = CenterLoss(2, 256).cuda()
   model_center_loss_img = CenterLoss(2, 512).cuda()
 
-  model.load_state_dict(torch.load(weight_path+'/model.pth',map_location="cpu"),strict=False)
-  model_center_loss.load_state_dict(torch.load(weight_path+'/center_loss.pth',map_location="cpu"),strict=False)
-  model_center_loss_img.load_state_dict(torch.load(weight_path+'/center_loss_img.pth',map_location="cpu"),strict=False)
+  model.load_state_dict(torch.load(model_weights_path, map_location="cpu"),strict=False)
+  model_center_loss.load_state_dict(torch.load(center_loss_weight_path,map_location="cpu"),strict=False)
+  model_center_loss_img.load_state_dict(torch.load(center_loss_img_weight_path,map_location="cpu"),strict=False)
 
   model.cuda().eval()
   model_center_loss.cuda().eval()
   model_center_loss_img.cuda().eval()
 
   # data load
-  data_path = '/mnt/data/yizhenyu/data/HP识别/workspace/Code_HP-Infection/cases/Positive_2' 
+  cases_path = path_join(this_dir, "cases")
+  case2_use = args.case
+  data_path = path_join(cases_path, case2_use) 
   images, names = inference_preprocess(data_path, testsize=352)
   bag_tensor = torch.stack(images).cuda()  # shape: [N, 3, 256, 256]
 

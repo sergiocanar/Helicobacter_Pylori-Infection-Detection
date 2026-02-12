@@ -7,9 +7,9 @@ from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from timm.models.registry import register_model
 from timm.models.vision_transformer import _cfg
 import math
-from .attmil import AttentionGated
+#FIXME Missing import 
 from .hagmil import IAMBlock
-from .transmil import TransMIL
+from admil import CenterLoss
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0., linear=False):
