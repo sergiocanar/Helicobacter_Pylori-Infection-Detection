@@ -42,65 +42,67 @@ def inference_preprocess(folder_path, testsize=256):
     return images, image_names
 
 def inference_one_bag(model, model_center_loss, model_center_loss_img, bags, names, topk = 7, save_img_name=None):
-
-  max_instances, _, _, _ = bags.size()
-  bag_softmax_out = []
-  bag_img_feature = []
-
-  bag_len = bags.size()[1]
-  for instance in range(0, bags.size()[1], 40):
-    split_images = bags[instance:instance+40, :, :, :]
-    split_images = split_images.cuda()
     
-    img_features, _, split_softmax_out = model(split_images.unsqueeze(0), is_train=False)
-    bag_softmax_out.append(split_softmax_out.squeeze(0))
-    bag_img_feature.append(img_features.squeeze(0))
-    split_images = split_images.cpu()
+    max_instances, C, H, W = bags.size() #N_images, Channels, Height, Width
+    bag_softmax_out = []
+    bag_img_feature = []
+    
 
-  bag_softmax_out = torch.cat(bag_softmax_out, dim=0)
-  probs_class_1 = bag_softmax_out[:, 1]
-  topk_values, topk_indices = torch.topk(probs_class_1, min(probs_class_1.size(0), topk))
-  topk_indices = topk_indices.cpu()
-  topk_imgs = bags[topk_indices, :, :, :] #[b, topk, 3, h, w]
+    bag_len = max_instances
+    for instance in range(0, max_instances, 40):
+        split_images = bags[instance:instance+40, :, :, :]
+        split_images = split_images.cuda()
 
-  img_feature, x_fc, bag_feature, lstm_out = model(topk_imgs.cuda().unsqueeze(0), is_train=True)
+        #Here they only extract features from PViTv2
+        img_features, _, split_softmax_out = model(split_images.unsqueeze(0), is_train=False)
+        bag_softmax_out.append(split_softmax_out.squeeze(0))
+        bag_img_feature.append(img_features.squeeze(0))
+        split_images = split_images.cpu()
 
-  topk_imgs = topk_imgs.squeeze(0).cpu()
+    bag_softmax_out = torch.cat(bag_softmax_out, dim=0)
+    probs_class_1 = bag_softmax_out[:, 1]
+    topk_values, topk_indices = torch.topk(probs_class_1, min(probs_class_1.size(0), topk))
+    topk_indices = topk_indices.cpu()
+    topk_imgs = bags[topk_indices, :, :, :] #[b, topk, 3, h, w]
 
-  # -- 1. LSTM Output
-  patient_pred_lstm = torch.tensor([1]) if F.softmax(lstm_out, dim=1)[-1][-1].item() > 0.5 else torch.tensor([0])
-  # -- 2. topk img Output mean
-  patient_pred_img_mean = torch.tensor([1]) if topk_values.mean() > 0.5 else torch.tensor([0])
-  topk_img_pred = (topk_values > 0.5).float().cpu()
- # -- 3. Patient CenterLoss Output
-  center_loss_output = model_center_loss.get_assignment(bag_feature)
-  center_loss_probs = center_loss_output.detach()[:, 1].clone()
-  patient_pred_pat_center = torch.tensor([1]) if center_loss_probs[0] > 0.5 else torch.tensor([0])
+    img_feature, x_fc, bag_feature, lstm_out = model(topk_imgs.cuda().unsqueeze(0), is_train=True)
 
-  # -- 4. topk img CenterLoss Output
-  img_feature = torch.cat(bag_img_feature, dim=0)
-  center_loss_img_output = model_center_loss_img.get_assignment(img_feature.squeeze(0))
-  # center_loss_img_output.size():torch.Size([7,2])
-  center_loss_img_probs = center_loss_img_output.detach()[:, 1].clone().cpu()
-  # center_loss_img_output.size():torch.Size([7])
-  topk_values_img_center, _ = torch.topk(center_loss_img_probs, min(center_loss_img_probs.size(0), topk))
-  topk_img_pred_img_center = (topk_values_img_center > 0.5).float()
+    topk_imgs = topk_imgs.squeeze(0).cpu()
 
-  patient_pred_img_center_mean = torch.tensor([1]) if topk_values_img_center.mean() > 0.5 else torch.tensor([0])
+    # -- 1. LSTM Output - given best encoder topk images.
+    patient_pred_lstm = torch.tensor([1]) if F.softmax(lstm_out, dim=1)[-1][-1].item() > 0.5 else torch.tensor([0])
+    # -- 2. topk img Output mean
+    patient_pred_img_mean = torch.tensor([1]) if topk_values.mean() > 0.5 else torch.tensor([0])
+    topk_img_pred = (topk_values > 0.5).float().cpu()
+    # -- 3. Patient CenterLoss Output
+    center_loss_output = model_center_loss.get_assignment(bag_feature)
+    center_loss_probs = center_loss_output.detach()[:, 1].clone()
+    patient_pred_pat_center = torch.tensor([1]) if center_loss_probs[0] > 0.5 else torch.tensor([0])
 
-  # -- Concat all Outputs
-  preds_patient = [patient_pred_lstm, patient_pred_img_mean, patient_pred_pat_center, patient_pred_img_center_mean]
-  preds_topkImgs = [[F.softmax(lstm_out, dim=1)[-1][-1].cpu().item()], [topk_values.mean().cpu().item()], 
-      [center_loss_probs[0].cpu().item()], [topk_values_img_center.mean().cpu().item()]]
-  
-  if save_img_name is not None:
-    debout = save_result(
-        bags, names, center_loss_img_probs.cpu().numpy(), probs_class_1.cpu().numpy(),
-        topk_indices.cpu(), F.softmax(lstm_out, dim=1)[-1][-1].cpu().item(),
-        center_loss_probs[0].cpu().item(), topk_values_img_center.mean().item())
-    cv2.imwrite(save_img_name, debout)
+    # -- 4. topk img CenterLoss Output
+    img_feature = torch.cat(bag_img_feature, dim=0)
+    center_loss_img_output = model_center_loss_img.get_assignment(img_feature.squeeze(0))
+    # center_loss_img_output.size():torch.Size([7,2])
+    center_loss_img_probs = center_loss_img_output.detach()[:, 1].clone().cpu()
+    # center_loss_img_output.size():torch.Size([7])
+    topk_values_img_center, _ = torch.topk(center_loss_img_probs, min(center_loss_img_probs.size(0), topk))
+    topk_img_pred_img_center = (topk_values_img_center > 0.5).float()
 
-  return preds_patient, preds_topkImgs, bag_len
+    patient_pred_img_center_mean = torch.tensor([1]) if topk_values_img_center.mean() > 0.5 else torch.tensor([0])
+
+    # -- Concat all Outputs
+    preds_patient = [patient_pred_lstm, patient_pred_img_mean, patient_pred_pat_center, patient_pred_img_center_mean]
+    preds_topkImgs = [[F.softmax(lstm_out, dim=1)[-1][-1].cpu().item()], [topk_values.mean().cpu().item()], 
+        [center_loss_probs[0].cpu().item()], [topk_values_img_center.mean().cpu().item()]]
+
+    if save_img_name is not None:
+        debout = save_result(
+            bags, names, center_loss_img_probs.cpu().numpy(), probs_class_1.cpu().numpy(),
+            topk_indices.cpu(), F.softmax(lstm_out, dim=1)[-1][-1].cpu().item(),
+            center_loss_probs[0].cpu().item(), topk_values_img_center.mean().item())
+        cv2.imwrite(save_img_name, debout)
+
+    return preds_patient, preds_topkImgs, bag_len
 
 def save_result(out, topk_names, top_labels, top_values, topk_indices, lstm_out, center_pred=None, center_pred_img=None, images_per_row=8, size=(200, 200)):
     rows = []

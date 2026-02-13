@@ -312,12 +312,13 @@ class LSTMModel(nn.Module):
     def forward(self, x, is_train=True):
         b, k, c, w, h = x.size()
         x = x.view(-1, c, w, h)
-        x_feature, x_logits, x_softmax = self.feature_extractor(x)
-        x_feature = x_feature.view(b, k, -1)
+        x_feature, x_logits, x_softmax = self.feature_extractor(x) #[k, hd], [k,labels], [k, labels]
+        x_feature = x_feature.view(b, k, -1) #Add B
         x_logits = x_logits.view(b, k, -1)
         x_softmax = x_softmax.view(b, k, -1)
 
         if not is_train:
+            
             return F.normalize(x_feature, dim=-1), x_logits, x_softmax
             # return x_feature, x_logits, x_softmax
         else:
@@ -332,7 +333,7 @@ class LSTMModel(nn.Module):
 
             ## 2. LSTM ##
             h_lstm, _ = self.lstm(x_feature)
-            bag_out = self.fc(h_lstm[:, -1, :])  # 使用最后一个LSTM cell的输出
+            bag_out = self.fc(h_lstm[:, -1, :])  # 使用最后一个LSTM cell的输出. Uses last output of LSTM
             return F.normalize(x_feature, dim=-1), x_logits, F.normalize(h_lstm[:, -1, :]), bag_out
 
 class LSTMModelEnd2End(nn.Module):
