@@ -3,8 +3,9 @@ import random
 import torch
 import pandas as pd
 from PIL import Image
-from torch.utils.data import Dataset
 from torchvision import transforms
+from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
 
 
 class BagDataset(Dataset):
