@@ -1,4 +1,5 @@
 import os
+import json
 import numpy as np
 import sys
 import cv2
@@ -12,6 +13,11 @@ import pandas as pd
 
 from PIL import Image
 from torchvision import transforms
+
+def load_json(path: str)->dict:
+    with open(path, "r") as f:
+        data = json.load(f)
+    return data
 
 def inference_preprocess(folder_path, testsize=256):
 
