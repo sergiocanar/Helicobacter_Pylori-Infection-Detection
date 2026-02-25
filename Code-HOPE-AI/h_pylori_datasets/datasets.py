@@ -7,6 +7,38 @@ from torchvision import transforms
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 
+# ---------------------------------------------------------------------------
+# Flat per-image dataset (no bag grouping needed here)
+# ---------------------------------------------------------------------------
+
+class FrameDataset(Dataset):
+    def __init__(self, csv_paths, frames_root, desired_triple_agreement=None, img_size=352):
+        dfs = [pd.read_csv(p) for p in csv_paths]
+        df = pd.concat(dfs, ignore_index=True).drop_duplicates(subset='frame_path')
+
+        if desired_triple_agreement is not None:
+            df = df[df["Triple_Agreement"].isin(desired_triple_agreement)]
+
+        self.frames_root = frames_root
+        self.frame_paths = df['frame_path'].tolist()
+        self.patient_ids = df['patient_id'].astype(int).tolist()
+        self.labels = df['HP'].astype(int).tolist()
+        self.region = df["Triple_Agreement"].tolist()
+
+        self.transform = transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+
+    def __len__(self):
+        return len(self.frame_paths)
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.frames_root, self.frame_paths[idx])
+        img = Image.open(img_path).convert('RGB')
+        return self.transform(img), self.patient_ids[idx], self.labels[idx], idx
+
 
 class BagDataset(Dataset):
     """
@@ -29,8 +61,12 @@ class BagDataset(Dataset):
     """
 
     def __init__(self, csv_path: str, frames_root: str, img_size: int = 352,
-                 max_frames: int = None):
+                 max_frames: int = None, desired_triple_agreement=None):
         df = pd.read_csv(csv_path)
+
+        if desired_triple_agreement is not None:
+            df = df[df["Triple_Agreement"].isin(desired_triple_agreement)]
+
         self.frames_root = frames_root
         self.max_frames  = max_frames
         self.transform = transforms.Compose([
