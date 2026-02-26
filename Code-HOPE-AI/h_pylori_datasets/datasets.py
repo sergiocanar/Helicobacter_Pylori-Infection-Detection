@@ -12,18 +12,15 @@ from torch.utils.data import DataLoader
 # ---------------------------------------------------------------------------
 
 class FrameDataset(Dataset):
-    def __init__(self, csv_paths, frames_root, desired_triple_agreement=None, img_size=352):
+    def __init__(self, csv_paths, frames_root, desired_triple_agreement=None, img_size=352,
+                 keyframe_only=False):
         dfs = [pd.read_csv(p) for p in csv_paths]
         df = pd.concat(dfs, ignore_index=True).drop_duplicates(subset='frame_path')
-
-        if desired_triple_agreement is not None:
-            df = df[df["Triple_Agreement"].isin(desired_triple_agreement)]
 
         self.frames_root = frames_root
         self.frame_paths = df['frame_path'].tolist()
         self.patient_ids = df['patient_id'].astype(int).tolist()
         self.labels = df['HP'].astype(int).tolist()
-        self.region = df["Triple_Agreement"].tolist()
 
         self.transform = transforms.Compose([
             transforms.Resize((img_size, img_size)),
@@ -112,6 +109,79 @@ def bag_collate(batch):
     """
     bag_tensor, label, patient_id = batch[0]
     return bag_tensor, torch.tensor(label, dtype=torch.long), patient_id
+
+
+# ---------------------------------------------------------------------------
+# Per-patient keyframe-feature dataset (for Transformer classifier)
+# ---------------------------------------------------------------------------
+
+class PatientKFDataset(Dataset):
+    """
+    Loads pre-extracted keyframe embeddings (one .pth per patient).
+
+    Each item is one patient. Returns:
+        embeddings  : Tensor [N_kf, 512]
+        label       : int  (HP 0 / 1)
+        patient_id  : int
+
+    Args:
+        csv_path        : split CSV (frame-level); used only to get the unique
+                          patient-id ↔ HP-label mapping for this split.
+        kf_features_dir : directory containing patient_<id>.pth files produced
+                          by extract_kf_features.py.
+    """
+
+    def __init__(self, csv_path: str, kf_features_dir: str):
+        df = pd.read_csv(csv_path)
+        patient_labels = (
+            df.groupby('patient_id')['HP']
+            .first()
+            .reset_index()
+        )
+        self.kf_features_dir = kf_features_dir
+        self.patients = [
+            {'patient_id': int(row['patient_id']), 'label': int(row['HP'])}
+            for _, row in patient_labels.iterrows()
+        ]
+
+    def __len__(self) -> int:
+        return len(self.patients)
+
+    def __getitem__(self, idx: int):
+        p = self.patients[idx]
+        pid = p['patient_id']
+        pth_path = os.path.join(self.kf_features_dir, f'patient_{pid:03d}.pth')
+        data = torch.load(pth_path, map_location='cpu', weights_only=True)
+        embeddings = data['embeddings']   # [N_kf, 512]
+        return embeddings, p['label'], pid
+
+
+def patient_kf_collate(batch):
+    """
+    Collate for PatientKFDataset with batch_size > 1.
+    Pads all bags to the longest sequence in the batch and returns a
+    boolean padding mask (True = padded position, to match PyTorch's
+    src_key_padding_mask convention).
+
+    Returns:
+        padded   : Tensor [B, max_N, 512]
+        labels   : Tensor [B]  (long)
+        pids     : list[int]
+        pad_mask : BoolTensor [B, max_N]  — True where padded
+    """
+    embeddings_list, labels, pids = zip(*batch)
+    max_n = max(e.shape[0] for e in embeddings_list)
+    dim   = embeddings_list[0].shape[1]
+
+    padded   = torch.zeros(len(batch), max_n, dim)
+    pad_mask = torch.ones(len(batch), max_n, dtype=torch.bool)   # True = pad
+
+    for i, e in enumerate(embeddings_list):
+        n = e.shape[0]
+        padded[i, :n]   = e
+        pad_mask[i, :n] = False   # real tokens
+
+    return padded, torch.tensor(labels, dtype=torch.long), list(pids), pad_mask
 
 
 if __name__ == '__main__':
