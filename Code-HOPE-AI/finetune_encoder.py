@@ -54,7 +54,13 @@ from torch.amp import autocast
 import pandas as pd
 from PIL import Image
 from torchvision import transforms
-from sklearn.metrics import roc_auc_score
+import json
+import numpy as np
+import wandb
+from sklearn.metrics import (
+    roc_auc_score, f1_score, precision_score, recall_score,
+    average_precision_score,
+)
 from tqdm import tqdm
 
 # Local model definition (pvt_v2_b2 lives here)
@@ -205,11 +211,12 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device):
 
 @torch.no_grad()
 def validate(model, loader, criterion, device):
+    """Returns a dict with loss, acc, auc, f1, precision, recall, ap, probs, labels."""
     model.eval()
     total_loss = 0.0
-    correct = 0
     n = 0
     all_probs  = []
+    all_preds  = []
     all_labels = []
 
     for imgs, labels in tqdm(loader, desc="  val  ", leave=False):
@@ -221,20 +228,40 @@ def validate(model, loader, criterion, device):
             loss = criterion(logits, labels)
 
         total_loss += loss.item() * imgs.size(0)
-        correct    += (logits.argmax(1) == labels).sum().item()
         n          += imgs.size(0)
 
         all_probs.extend(softmax[:, 1].cpu().tolist())
+        all_preds.extend(logits.argmax(1).cpu().tolist())
         all_labels.extend(labels.cpu().tolist())
 
+    y_true = np.array(all_labels)
+    y_prob = np.array(all_probs)
+    y_pred = np.array(all_preds)
+
     avg_loss = total_loss / n
-    acc      = correct / n
+    acc      = (y_pred == y_true).mean()
+
     try:
-        auc = roc_auc_score(all_labels, all_probs)
+        auc = roc_auc_score(y_true, y_prob)
     except ValueError:
         auc = float("nan")
 
-    return avg_loss, acc, auc
+    ap        = average_precision_score(y_true, y_prob)
+    f1        = f1_score(y_true, y_pred, zero_division=0)
+    precision = precision_score(y_true, y_pred, zero_division=0)
+    recall    = recall_score(y_true, y_pred, zero_division=0)
+
+    return {
+        "loss":      avg_loss,
+        "acc":       float(acc),
+        "auc":       auc,
+        "ap":        ap,
+        "f1":        f1,
+        "precision": precision,
+        "recall":    recall,
+        "probs":     y_prob,   # (N,)  positive-class prob
+        "labels":    y_true,   # (N,)  ground-truth
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -266,22 +293,42 @@ def parse_args():
     parser.add_argument("--warmup_epochs",  type=int,   default=3)
     parser.add_argument("--num_classes",    type=int,   default=2)
 
+    # W&B
+    parser.add_argument("--wandb_project", default="hp-pylori-finetune",
+                        help="W&B project name")
+    parser.add_argument("--wandb_entity",  default=None,
+                        help="W&B entity (team/user). Omit to use the default.")
+    parser.add_argument("--run_name",      default=None,
+                        help="Override the auto-generated W&B run name")
+
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    # Paths
-    this_dir = os.path.dirname(os.path.abspath(__file__))
-    data_dir = path_join(this_dir, "data", "GrastroHUN_Hpylori")
+
+    # ---- Paths ----
+    this_dir   = os.path.dirname(os.path.abspath(__file__))
+    data_dir   = path_join(this_dir, "data", "GrastroHUN_Hpylori")
     images_dir = path_join(data_dir, "yao_images")
     labels_dir = path_join(data_dir, "yao_labels")
     output_dir = path_join(this_dir, args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
+    # ---- W&B init ----
+    # Use checkpoint basename to label the init type (imagenet vs hopeai)
+    ckpt_tag  = "imagenet" if "pvt_v2_b2" in os.path.basename(args.checkpoint) else "hopeai"
+    run_name  = args.run_name or f"{ckpt_tag}_fold{args.fold}"
+    wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity or None,
+        name=run_name,
+        group=ckpt_tag,        # groups imagenet runs / hopeai runs together
+        config=vars(args),
+    )
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-    print(f"Fold  : {args.fold}")
+    print(f"Device: {device}  |  Fold: {args.fold}  |  Init: {ckpt_tag}")
 
     # ---- Data ----
     train_csv = os.path.join(labels_dir, f"fold{args.fold}_train.csv")
@@ -318,17 +365,12 @@ def main():
                                 backbone_lr_scale=args.backbone_lr_scale,
                                 weight_decay=args.weight_decay)
 
-    # Cosine LR schedule with linear warmup (epoch-based)
     warmup_scheduler = optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=1e-3,
-        end_factor=1.0,
+        optimizer, start_factor=1e-3, end_factor=1.0,
         total_iters=args.warmup_epochs,
     )
     cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=args.epochs - args.warmup_epochs,
-        eta_min=1e-7,
+        optimizer, T_max=args.epochs - args.warmup_epochs, eta_min=1e-7,
     )
     scheduler = optim.lr_scheduler.SequentialLR(
         optimizer,
@@ -337,10 +379,18 @@ def main():
     )
     scaler = GradScaler()
 
+    # ---- Save config artifact ----
+    config_path = os.path.join(output_dir, f"{run_name}_config.json")
+    with open(config_path, "w") as f:
+        json.dump(vars(args), f, indent=2)
+    config_artifact = wandb.Artifact(f"config-{run_name}", type="config")
+    config_artifact.add_file(config_path)
+    wandb.log_artifact(config_artifact)
+
     # ---- Training loop ----
-    best_auc   = 0.0
-    best_ckpt  = os.path.join(args.output_dir, f"fold{args.fold}_best.pth")
-    last_ckpt  = os.path.join(args.output_dir, f"fold{args.fold}_last.pth")
+    best_f1   = 0.0
+    best_ckpt = os.path.join(output_dir, f"{run_name}_best.pth")
+    last_ckpt = os.path.join(output_dir, f"{run_name}_last.pth")
 
     for epoch in range(1, args.epochs + 1):
         print(f"\nEpoch {epoch}/{args.epochs}")
@@ -349,35 +399,70 @@ def main():
             model, train_loader, criterion, optimizer, scaler, device)
         scheduler.step()
 
-        val_loss, val_acc, val_auc = validate(model, val_loader, criterion, device)
+        vm = validate(model, val_loader, criterion, device)
 
         head_lr = optimizer.param_groups[-1]["lr"]
-        print(f"  train loss={train_loss:.4f}  acc={train_acc:.3f}")
-        print(f"  val   loss={val_loss:.4f}  acc={val_acc:.3f}  AUC={val_auc:.4f}")
+        print(f"  train  loss={train_loss:.4f}  acc={train_acc:.3f}")
+        print(f"  val    loss={vm['loss']:.4f}  acc={vm['acc']:.3f}  "
+              f"AUC={vm['auc']:.4f}  AP={vm['ap']:.4f}  "
+              f"F1={vm['f1']:.4f}  P={vm['precision']:.4f}  R={vm['recall']:.4f}")
         print(f"  head lr={head_lr:.2e}")
 
-        # Save last
+        # Build PR-curve data for wandb
+        # wandb.plot.pr_curve expects y_probas of shape (N, n_classes)
+        y_probas_2d = np.stack([1.0 - vm["probs"], vm["probs"]], axis=1)
+        pr_curve = wandb.plot.pr_curve(
+            vm["labels"], y_probas_2d, labels=["negative", "positive"]
+        )
+
+        wandb.log({
+            "epoch":            epoch,
+            "train/loss":       train_loss,
+            "train/acc":        train_acc,
+            "val/loss":         vm["loss"],
+            "val/acc":          vm["acc"],
+            "val/auc":          vm["auc"],
+            "val/ap":           vm["ap"],
+            "val/f1":           vm["f1"],
+            "val/precision":    vm["precision"],
+            "val/recall":       vm["recall"],
+            "val/pr_curve":     pr_curve,
+            "lr/head":          head_lr,
+        }, step=epoch)
+
+        # Save last checkpoint
         torch.save({
-            "epoch":      epoch,
-            "model":      model.state_dict(),
-            "optimizer":  optimizer.state_dict(),
-            "val_auc":    val_auc,
-            "args":       vars(args),
+            "epoch":     epoch,
+            "model":     model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "val_auc":   vm["auc"],
+            "args":      vars(args),
         }, last_ckpt)
 
-        # Save best
-        if val_auc > best_auc:
-            best_auc = val_auc
+        # Save best checkpoint (criterion: val/f1)
+        if vm["f1"] > best_f1:
+            best_f1 = vm["f1"]
             torch.save({
                 "epoch":   epoch,
                 "model":   model.state_dict(),
-                "val_auc": val_auc,
+                "val_auc": vm["auc"],
+                "val_ap":  vm["ap"],
+                "val_f1":  vm["f1"],
                 "args":    vars(args),
             }, best_ckpt)
-            print(f"  ** New best AUC={best_auc:.4f} saved to {best_ckpt}")
+            wandb.run.summary["best_f1"]    = best_f1
+            wandb.run.summary["best_epoch"] = epoch
+            print(f"  ** New best F1={best_f1:.4f} → {best_ckpt}")
 
-    print(f"\nTraining complete.  Best val AUC: {best_auc:.4f}")
-    print(f"Checkpoints saved in: {args.output_dir}")
+    # ---- Upload best model as artifact ----
+    model_artifact = wandb.Artifact(f"model-{run_name}", type="model",
+                                    metadata={"best_f1": best_f1})
+    model_artifact.add_file(best_ckpt)
+    wandb.log_artifact(model_artifact)
+
+    wandb.finish()
+    print(f"\nTraining complete.  Best val F1: {best_f1:.4f}")
+    print(f"Checkpoints saved in: {output_dir}")
 
 
 if __name__ == "__main__":

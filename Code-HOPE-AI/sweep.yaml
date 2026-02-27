@@ -1,0 +1,48 @@
+program: finetune_encoder.py
+method: grid
+
+command:
+  - env
+  - CUDA_VISIBLE_DEVICES=2
+  - python
+  - ${program}
+  - ${args}
+
+metric:
+  goal: maximize
+  name: val/f1
+
+parameters:
+  # Primary comparison: ImageNet init vs HOPE-AI (LSTMModel) init
+  checkpoint:
+    values:
+      - weights/pvt_v2_b2.pth   # ImageNet pretrained
+      - model.pth                # HOPE-AI / LSTMModel pretrained
+
+  # Cross-validation folds
+  fold:
+    values: [1, 2, 3]
+
+  # Head learning rate
+  lr:
+    values: [1e-4, 3e-4]
+
+  # Backbone gets lr * backbone_lr_scale (with per-stage layerwise decay)
+  backbone_lr_scale:
+    value: 0.1
+
+  # Fixed training settings
+  epochs:
+    value: 30
+  batch_size:
+    value: 32
+  img_size:
+    value: 352
+  warmup_epochs:
+    value: 3
+  weight_decay:
+    value: 1e-4
+  num_classes:
+    value: 2
+  output_dir:
+    value: outputs/sweep
