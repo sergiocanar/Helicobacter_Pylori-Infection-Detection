@@ -184,6 +184,36 @@ def patient_kf_collate(batch):
     return padded, torch.tensor(labels, dtype=torch.long), list(pids), pad_mask
 
 
+class YaoFrameDataset(Dataset):
+    """Frame-level dataset from Yao H. Pylori CSV splits.
+
+    Args:
+        csv_path  : path to fold CSV (columns: frame_path, patient_id, HP, OLGA)
+        images_root : root directory that contains video_XXX/ sub-folders
+        transform   : torchvision transform
+    """
+
+    def __init__(self, csv_path: str, images_root: str, transform=None):
+        self.df = pd.read_csv(csv_path)
+        self.images_root = Path(images_root)
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        img_path = self.images_root / row["frame_path"]
+        label = int(row["HP"])
+
+        img = Image.open(img_path).convert("RGB")
+        if self.transform is not None:
+            img = self.transform(img)
+
+        return img, label
+
+
+
 if __name__ == '__main__':
 
     this_dir    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
