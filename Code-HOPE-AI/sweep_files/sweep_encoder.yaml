@@ -1,5 +1,6 @@
 program: finetune_encoder.py
 method: bayes
+run_cap: 30
 
 command:
   - env

@@ -195,7 +195,7 @@ class YaoFrameDataset(Dataset):
 
     def __init__(self, csv_path: str, images_root: str, transform=None):
         self.df = pd.read_csv(csv_path)
-        self.images_root = Path(images_root)
+        self.images_root = images_root
         self.transform = transform
 
     def __len__(self):
@@ -203,7 +203,7 @@ class YaoFrameDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        img_path = self.images_root / row["frame_path"]
+        img_path = os.path.join(self.images_root, row["frame_path"])
         label = int(row["HP"])
 
         img = Image.open(img_path).convert("RGB")
