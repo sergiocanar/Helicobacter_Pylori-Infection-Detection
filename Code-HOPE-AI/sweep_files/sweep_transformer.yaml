@@ -1,0 +1,55 @@
+program: train_transformer.py
+method: bayes
+run_cap: 30
+
+command:
+  - env
+  - CUDA_VISIBLE_DEVICES=3
+  - python
+  - ${program}
+  - --fold
+  - "1"          # ← change to 2 or 3 before registering the next sweep
+  - ${args}
+
+metric:
+  name: val/f1
+  goal: maximize
+
+early_terminate:
+  type: hyperband
+  min_iter: 10   # don't kill runs before epoch 10
+
+parameters:
+
+  # ── Model ──────────────────────────────────────────────────────────────────
+  hidden_dim:
+    value: 512
+
+  # n_heads must divide hidden_dim; kept as categorical
+  n_heads:
+    values: [4, 8, 16]
+
+  n_layers:
+    values: [1, 2, 4, 6]
+
+  dropout:
+    distribution: uniform
+    min: 0.0
+    max: 0.5
+
+  # ── Training ───────────────────────────────────────────────────────────────
+  lr:
+    distribution: log_uniform_values
+    min: 1e-5
+    max: 1e-3
+
+  wd:
+    distribution: log_uniform_values
+    min: 1e-6
+    max: 1e-2
+
+  batch_size:
+    value: 32
+
+  epochs:
+    value: 25

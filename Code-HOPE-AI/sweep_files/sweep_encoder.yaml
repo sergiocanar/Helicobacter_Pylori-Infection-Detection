@@ -1,11 +1,13 @@
 program: finetune_encoder.py
-method: grid
+method: bayes
 
 command:
   - env
   - CUDA_VISIBLE_DEVICES=2
   - python
   - ${program}
+  - --fold
+  - "1"          # ← change to 2 or 3 before registering the next sweep
   - ${args}
 
 metric:
@@ -19,17 +21,17 @@ parameters:
       - weights/pvt_v2_b2.pth   # ImageNet pretrained
       - model.pth                # HOPE-AI / LSTMModel pretrained
 
-  # Cross-validation folds
-  fold:
-    values: [1, 2, 3]
-
-  # Head learning rate
+  # Learning rate — log-uniform range (bayes samples in log space)
   lr:
-    values: [1e-4, 3e-4]
+    distribution: log_uniform_values
+    min: 1e-5
+    max: 1e-3
 
-  # Backbone gets lr * backbone_lr_scale (with per-stage layerwise decay)
-  backbone_lr_scale:
-    value: 0.1
+  # Weight decay — log-uniform range
+  weight_decay:
+    distribution: log_uniform_values
+    min: 1e-5
+    max: 1e-2
 
   # Fixed training settings
   epochs:
@@ -40,8 +42,6 @@ parameters:
     value: 352
   warmup_epochs:
     value: 3
-  weight_decay:
-    value: 1e-4
   num_classes:
     value: 2
   output_dir:
