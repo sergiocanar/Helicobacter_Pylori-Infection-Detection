@@ -46,13 +46,12 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from h_pylori_datasets.datasets import YaoFrameDataset
 from torch.cuda.amp import GradScaler
 from torch.amp import autocast
 
 import pandas as pd
-from PIL import Image
 from torchvision import transforms
 import json
 import numpy as np
@@ -79,11 +78,7 @@ IMAGENET_STD  = [0.229, 0.224, 0.225]
 def build_transforms(img_size: int, train: bool):
     if train:
         return transforms.Compose([
-            transforms.RandomResizedCrop(img_size, scale=(0.7, 1.0)),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomVerticalFlip(),
-            transforms.ColorJitter(brightness=0.3, contrast=0.3,
-                                   saturation=0.2, hue=0.05),
+            transforms.Resize((img_size, img_size)),
             transforms.ToTensor(),
             transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ])
@@ -120,10 +115,13 @@ def load_encoder_from_checkpoint(ckpt_path: str, num_classes: int = 2) -> nn.Mod
         source = "LSTMModel checkpoint"
         strict = True
     else:
-        # ImageNet pretrained weights: keys are already bare
-        encoder_sd = dict(full_sd)
+        # ImageNet pretrained weights: keys are already bare.
+        # Drop the head (1000-class classifier) so the randomly-initialised
+        # head in the model is kept intact — strict=False alone is not enough
+        # because PyTorch still errors on shape mismatches for shared key names.
+        encoder_sd = {k: v for k, v in full_sd.items() if not k.startswith("head")}
         source = "ImageNet weights"
-        strict = False   # head may have different num_classes
+        strict = False
 
     missing, unexpected = encoder.load_state_dict(encoder_sd, strict=strict)
     if missing:
@@ -134,47 +132,6 @@ def load_encoder_from_checkpoint(ckpt_path: str, num_classes: int = 2) -> nn.Mod
     print(f"Encoder loaded from {source}: {ckpt_path}  ({len(encoder_sd)} tensors)")
     return encoder
 
-def build_optimizer(model: nn.Module, lr: float, backbone_lr_scale: float,
-                    weight_decay: float = 1e-4) -> optim.Optimizer:
-    """Lower LR for backbone stages, full LR for the classification head.
-
-    Stage assignment (PVT-v2):
-        stage 0 : patch_embed1, block1, norm1
-        stage 1 : patch_embed2, block2, norm2
-        stage 2 : patch_embed3, block3, norm3
-        stage 3 : patch_embed4, block4, norm4
-        head    : head
-    """
-    head_params   = []
-    stage_params  = [[] for _ in range(4)]
-
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if name.startswith("head"):
-            head_params.append(param)
-        else:
-            for s in range(4):
-                if (f"patch_embed{s+1}" in name or
-                    f"block{s+1}" in name or
-                    f"norm{s+1}" in name):
-                    stage_params[s].append(param)
-                    break
-
-    # Deeper stages get a slightly higher LR (layerwise decay)
-    layer_decay = 0.75   # each earlier stage is scaled by this factor
-    param_groups = []
-    for s in range(4):
-        stage_lr = lr * backbone_lr_scale * (layer_decay ** (3 - s))
-        param_groups.append({
-            "params": stage_params[s],
-            "lr": stage_lr,
-            "name": f"stage{s+1}",
-        })
-    param_groups.append({"params": head_params, "lr": lr, "name": "head"})
-
-    optimizer = optim.AdamW(param_groups, weight_decay=weight_decay)
-    return optimizer
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +180,7 @@ def validate(model, loader, criterion, device):
         imgs   = imgs.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        with autocast():
+        with autocast(device_type=device.type):
             _, logits, softmax = model(imgs)
             loss = criterion(logits, labels)
 
@@ -284,11 +241,9 @@ def parse_args():
 
     # Training
     parser.add_argument("--epochs",         type=int,   default=30)
-    parser.add_argument("--batch_size",     type=int,   default=32)
+    parser.add_argument("--batch_size",     type=int,   default=64)
     parser.add_argument("--lr",             type=float, default=1e-4,
                         help="Learning rate for the classification head")
-    parser.add_argument("--backbone_lr_scale", type=float, default=0.1,
-                        help="Backbone LR = lr * this scale (before layerwise decay)")
     parser.add_argument("--weight_decay",   type=float, default=1e-4)
     parser.add_argument("--warmup_epochs",  type=int,   default=3)
     parser.add_argument("--num_classes",    type=int,   default=2)
@@ -318,7 +273,7 @@ def main():
     # ---- W&B init ----
     # Use checkpoint basename to label the init type (imagenet vs hopeai)
     ckpt_tag  = "imagenet" if "pvt_v2_b2" in os.path.basename(args.checkpoint) else "hopeai"
-    run_name  = args.run_name or f"{ckpt_tag}_fold{args.fold}"
+    run_name  = args.run_name or f"{ckpt_tag}_fold{args.fold}_lr{args.lr:.0e}"
     wandb.init(
         project=args.wandb_project,
         entity=args.wandb_entity or None,
@@ -356,14 +311,12 @@ def main():
     n_neg = (df_train["HP"] == 0).sum()
     n_pos = (df_train["HP"] == 1).sum()
     pos_weight = n_neg / max(n_pos, 1)
-    class_weights = torch.tensor([1.0, pos_weight], device=device)
+    class_weights = torch.tensor([1.0, pos_weight], dtype=torch.float32, device=device)
     print(f"Class balance  neg={n_neg}  pos={n_pos}  weight_pos={pos_weight:.2f}")
     criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     # ---- Optimiser & Scheduler ----
-    optimizer = build_optimizer(model, lr=args.lr,
-                                backbone_lr_scale=args.backbone_lr_scale,
-                                weight_decay=args.weight_decay)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     warmup_scheduler = optim.lr_scheduler.LinearLR(
         optimizer, start_factor=1e-3, end_factor=1.0,
@@ -379,8 +332,12 @@ def main():
     )
     scaler = GradScaler()
 
+    # ---- Per-run output subfolder ----
+    run_dir = os.path.join(output_dir, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+
     # ---- Save config artifact ----
-    config_path = os.path.join(output_dir, f"{run_name}_config.json")
+    config_path = os.path.join(run_dir, "config.json")
     with open(config_path, "w") as f:
         json.dump(vars(args), f, indent=2)
     config_artifact = wandb.Artifact(f"config-{run_name}", type="config")
@@ -389,8 +346,8 @@ def main():
 
     # ---- Training loop ----
     best_f1   = 0.0
-    best_ckpt = os.path.join(output_dir, f"{run_name}_best.pth")
-    last_ckpt = os.path.join(output_dir, f"{run_name}_last.pth")
+    best_ckpt = os.path.join(run_dir, "best.pth")
+    last_ckpt = os.path.join(run_dir, "last.pth")
 
     for epoch in range(1, args.epochs + 1):
         print(f"\nEpoch {epoch}/{args.epochs}")
@@ -401,12 +358,12 @@ def main():
 
         vm = validate(model, val_loader, criterion, device)
 
-        head_lr = optimizer.param_groups[-1]["lr"]
+        current_lr = optimizer.param_groups[0]["lr"]
         print(f"  train  loss={train_loss:.4f}  acc={train_acc:.3f}")
         print(f"  val    loss={vm['loss']:.4f}  acc={vm['acc']:.3f}  "
               f"AUC={vm['auc']:.4f}  AP={vm['ap']:.4f}  "
               f"F1={vm['f1']:.4f}  P={vm['precision']:.4f}  R={vm['recall']:.4f}")
-        print(f"  head lr={head_lr:.2e}")
+        print(f"  lr={current_lr:.2e}")
 
         # Build PR-curve data for wandb
         # wandb.plot.pr_curve expects y_probas of shape (N, n_classes)
@@ -427,7 +384,7 @@ def main():
             "val/precision":    vm["precision"],
             "val/recall":       vm["recall"],
             "val/pr_curve":     pr_curve,
-            "lr/head":          head_lr,
+            "lr":               current_lr,
         }, step=epoch)
 
         # Save last checkpoint
@@ -454,15 +411,43 @@ def main():
             wandb.run.summary["best_epoch"] = epoch
             print(f"  ** New best F1={best_f1:.4f} → {best_ckpt}")
 
+    # ---- Final evaluation with best weights ----
+    best_sd = torch.load(best_ckpt, map_location=device)
+    model.load_state_dict(best_sd["model"])
+    vm_best = validate(model, val_loader, criterion, device)
+
+    # PR curve using all unique predicted probabilities as thresholds (sklearn default)
+    y_probas_2d = np.stack([1.0 - vm_best["probs"], vm_best["probs"]], axis=1)
+    final_pr = wandb.plot.pr_curve(
+        vm_best["labels"], y_probas_2d, labels=["negative", "positive"]
+    )
+    wandb.log({"val/final_pr_curve": final_pr})
+
+    # ---- Save metrics JSON ----
+    metrics = {
+        "best_epoch":    int(best_sd["epoch"]),
+        "val_f1":        float(vm_best["f1"]),
+        "val_auc":       float(vm_best["auc"]),
+        "val_ap":        float(vm_best["ap"]),
+        "val_precision": float(vm_best["precision"]),
+        "val_recall":    float(vm_best["recall"]),
+        "val_acc":       float(vm_best["acc"]),
+    }
+    metrics_path = os.path.join(run_dir, "metrics.json")
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+    print(f"Metrics  : {metrics}")
+
     # ---- Upload best model as artifact ----
     model_artifact = wandb.Artifact(f"model-{run_name}", type="model",
-                                    metadata={"best_f1": best_f1})
+                                    metadata=metrics)
     model_artifact.add_file(best_ckpt)
+    model_artifact.add_file(metrics_path)
     wandb.log_artifact(model_artifact)
 
     wandb.finish()
     print(f"\nTraining complete.  Best val F1: {best_f1:.4f}")
-    print(f"Checkpoints saved in: {output_dir}")
+    print(f"Checkpoints saved in: {run_dir}")
 
 
 if __name__ == "__main__":
