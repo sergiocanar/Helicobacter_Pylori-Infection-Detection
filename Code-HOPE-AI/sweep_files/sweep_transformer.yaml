@@ -1,14 +1,14 @@
 program: train_transformer.py
 method: bayes
-run_cap: 30
+run_cap: 90
 
 command:
   - env
-  - CUDA_VISIBLE_DEVICES=3
+  - CUDA_VISIBLE_DEVICES=1
   - python
   - ${program}
   - --fold
-  - "1"          # ← change to 2 or 3 before registering the next sweep
+  - "3"         
   - ${args}
 
 metric:

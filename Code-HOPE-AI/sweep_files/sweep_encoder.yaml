@@ -4,11 +4,11 @@ run_cap: 30
 
 command:
   - env
-  - CUDA_VISIBLE_DEVICES=2
+  - CUDA_VISIBLE_DEVICES=1
   - python
   - ${program}
   - --fold
-  - "1"          # ← change to 2 or 3 before registering the next sweep
+  - "2"          # ← change to 2 or 3 before registering the next sweep
   - ${args}
 
 metric:
@@ -19,8 +19,9 @@ parameters:
   # Primary comparison: ImageNet init vs HOPE-AI (LSTMModel) init
   checkpoint:
     values:
-      - weights/pvt_v2_b2.pth   # ImageNet pretrained
-      - model.pth                # HOPE-AI / LSTMModel pretrained
+      - weights/model.pth                # HOPE-AI / LSTMModel pretrained
+      - weights/pvt_v2_b2.pth          # ImageNet pretrained (PVTv2-B2)
+
 
   # Learning rate — log-uniform range (bayes samples in log space)
   lr:

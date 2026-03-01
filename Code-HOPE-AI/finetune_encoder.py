@@ -78,7 +78,20 @@ IMAGENET_STD  = [0.229, 0.224, 0.225]
 def build_transforms(img_size: int, train: bool):
     if train:
         return transforms.Compose([
-            transforms.Resize((img_size, img_size)),
+            # Mild crop: retains ≥70 % of the image area so RAC / erythema /
+            # nodularity patterns are not accidentally cropped away.  The
+            # Yao 22-station protocol means station context matters, so we
+            # keep the crop scale conservative.
+            transforms.RandomResizedCrop(img_size, scale=(0.7, 1.0), ratio=(0.9, 1.1)),
+            # Horizontal flip is valid — no side-specific anatomy in frame.
+            # Vertical flip is intentionally omitted: endoscope images have a
+            # fixed gravitational orientation and upside-down views are not
+            # realistic augmentations.
+            transforms.RandomHorizontalFlip(),
+            # Small geometric jitter: ±10° rotation + ≤5 % translation.
+            # Camera tilt and minor position offsets occur naturally; larger
+            # values would push texture patterns out of frame.
+            transforms.RandomAffine(degrees=10, translate=(0.05, 0.05)),
             transforms.ToTensor(),
             transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ])
