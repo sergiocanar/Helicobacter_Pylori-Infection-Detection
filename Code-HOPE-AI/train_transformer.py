@@ -144,8 +144,17 @@ def train(cfg: dict):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # ---- Datasets & loaders ----
-    train_ds = PatientKFDataset(train_csv, cfg['kf_dir'])
-    val_ds   = PatientKFDataset(val_csv,   cfg['kf_dir'])
+    # Support fold-split subdirectory layout (e.g. finetuned_kf_features/fold1_train/)
+    # If fold-specific subdirs exist, use them; otherwise fall back to the flat dir.
+    kf_train_dir = path_join(cfg['kf_dir'], f'fold{fold}_train')
+    kf_val_dir   = path_join(cfg['kf_dir'], f'fold{fold}_val')
+    if not os.path.isdir(kf_train_dir):
+        kf_train_dir = cfg['kf_dir']
+        kf_val_dir   = cfg['kf_dir']
+    log.info(f'KF features  train={kf_train_dir}  val={kf_val_dir}')
+
+    train_ds = PatientKFDataset(train_csv, kf_train_dir)
+    val_ds   = PatientKFDataset(val_csv,   kf_val_dir)
 
     log.info(f'Patients  train={len(train_ds)}  val={len(val_ds)}')
 
