@@ -8,7 +8,7 @@ command:
   - python
   - ${program}
   - --fold
-  - "2"          # ← change to 2 or 3 before registering the next sweep
+  - "3"          # ← change to 2 or 3 before registering the next sweep
   - ${args}
 
 metric:
