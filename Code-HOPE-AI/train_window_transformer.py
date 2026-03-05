@@ -1,23 +1,20 @@
 """
-train_transformer.py
+train_window_transformer.py
 
-Trains HPTransformerClassifier on pre-extracted per-patient keyframe embeddings.
-Primary metric: val/f1. Also tracks precision, recall, mAP and accuracy.
+Trains HPWindowTransformer end-to-end:
+    WindowKFContextualizer  — attention-pools a local frame window around each
+                              keyframe into a single contextualised embedding
+    HPTransformerClassifier — CLS + Transformer encoder over the per-patient
+                              sequence of contextualised KF embeddings → logit
 
-CSV splits are fold-based (fold1_train.csv / fold1_val.csv, …) identical to
-the encoder fine-tuning setup.  Each fold's val set is the held-out evaluation.
-
-Per-run output (under <output_dir>/fold{N}_{wandb_run_name}/):
-    best.pth               – best checkpoint (updated when val/f1 improves)
-    val_predictions.csv    – val predictions at the epoch of best val/f1
-    config.json            – full hyperparameter config
-    metrics.json           – best-val metrics + per-epoch history
+Features dir: data/GrastroHUN_Hpylori/full_seq_features/fold{N}_{split}/
+Labels dir:   data/GrastroHUN_Hpylori/labels/   (needs is_keyframe column)
 
 Standalone run:
-    python train_transformer.py --fold 1 [--lr 1e-4 --hidden_dim 256 ...]
+    python train_window_transformer.py --fold 1 [--window_size 11 --lr 1e-4 ...]
 
 W&B sweep:
-    1. Create sweep:   wandb sweep sweep_transformer.yaml
+    1. Create sweep:   wandb sweep sweep_files/sweep_window_transformer.yaml
     2. Launch agent:   wandb agent <entity>/<project>/<SWEEP_ID>
 """
 
@@ -38,8 +35,8 @@ from sklearn.metrics import (
 )
 import wandb
 
-from h_pylori_datasets.datasets import PatientKFDataset, patient_kf_collate
-from lib.masked_transformer import MaskedHPTransformerClassifier
+from h_pylori_datasets.datasets import PatientWindowDataset, patient_window_collate
+from lib.window_kf import HPWindowTransformer
 
 
 # ---------------------------------------------------------------------------
@@ -59,13 +56,14 @@ def evaluate(model, loader, device, criterion):
     all_labels, all_probs, all_pids = [], [], []
 
     with torch.no_grad():
-        for embeddings, labels, pids, pad_mask in loader:
-            embeddings = embeddings.to(device)
-            labels     = labels.to(device).float()
-            pad_mask   = pad_mask.to(device)
+        for windows, win_pad_mask, pat_pad_mask, labels, pids in loader:
+            windows      = windows.to(device)
+            win_pad_mask = win_pad_mask.to(device)
+            pat_pad_mask = pat_pad_mask.to(device)
+            labels       = labels.to(device).float()
 
-            logits = model(embeddings, pad_mask)
-            loss   = criterion(logits, labels)
+            logits, _ = model(windows, win_pad_mask, pat_pad_mask)
+            loss = criterion(logits, labels)
             total_loss += loss.item() * len(labels)
 
             all_probs.extend(torch.sigmoid(logits).cpu().tolist())
@@ -104,7 +102,7 @@ def train(cfg: dict):
     Core training loop. cfg is a plain dict with all hyperparameters and paths.
     Works identically for standalone runs and W&B sweep agents.
     """
-    # Skip invalid head/dim combinations gracefully (can occur during sweeps)
+    # Skip invalid head/dim combinations (can occur during sweeps)
     if cfg['hidden_dim'] % cfg['n_heads'] != 0:
         wandb.log({'val/f1': 0.0, 'val/loss': float('inf')})
         logging.warning(
@@ -113,12 +111,11 @@ def train(cfg: dict):
         )
         return
 
-    # Fold-based CSV paths
     fold      = cfg['fold']
     train_csv = path_join(cfg['labels_dir'], f'fold{fold}_train.csv')
     val_csv   = path_join(cfg['labels_dir'], f'fold{fold}_val.csv')
+    feat_root = cfg['feat_dir']
 
-    # Per-run output dir — fold prefix keeps sweep runs organised by fold
     run_dir = path_join(cfg['output_dir'], f"fold{fold}_{wandb.run.name}")
     os.makedirs(run_dir, exist_ok=True)
 
@@ -137,44 +134,37 @@ def train(cfg: dict):
     log = logging.getLogger()
     log.info(f'Device: cuda  |  Fold: {fold}  |  Run dir: {run_dir}')
 
-    # ---- Save config ----
     with open(path_join(run_dir, 'config.json'), 'w') as f:
         json.dump(dict(wandb.config), f, indent=2, default=str)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # ---- Datasets & loaders ----
-    # Support fold-split subdirectory layout (e.g. finetuned_kf_features/fold1_train/)
-    # If fold-specific subdirs exist, use them; otherwise fall back to the flat dir.
-    kf_train_dir = path_join(cfg['kf_dir'], f'fold{fold}_train')
-    kf_val_dir   = path_join(cfg['kf_dir'], f'fold{fold}_val')
-    if not os.path.isdir(kf_train_dir):
-        kf_train_dir = cfg['kf_dir']
-        kf_val_dir   = cfg['kf_dir']
-    log.info(f'KF features  train={kf_train_dir}  val={kf_val_dir}')
+    train_feat = path_join(feat_root, f'fold{fold}_train')
+    val_feat   = path_join(feat_root, f'fold{fold}_val')
+    log.info(f'Features  train={train_feat}  val={val_feat}')
 
-    train_ds = PatientKFDataset(train_csv, kf_train_dir)
-    val_ds   = PatientKFDataset(val_csv,   kf_val_dir)
-
+    train_ds = PatientWindowDataset(train_csv, train_feat, window_size=cfg['window_size'])
+    val_ds   = PatientWindowDataset(val_csv,   val_feat,   window_size=cfg['window_size'])
     log.info(f'Patients  train={len(train_ds)}  val={len(val_ds)}')
 
     train_loader = DataLoader(
         train_ds, batch_size=cfg['batch_size'], shuffle=True,
-        num_workers=cfg['num_workers'], collate_fn=patient_kf_collate,
+        num_workers=cfg['num_workers'], collate_fn=patient_window_collate,
     )
     val_loader = DataLoader(
         val_ds, batch_size=cfg['batch_size'], shuffle=False,
-        num_workers=cfg['num_workers'], collate_fn=patient_kf_collate,
+        num_workers=cfg['num_workers'], collate_fn=patient_window_collate,
     )
 
     # ---- Model ----
-    model = MaskedHPTransformerClassifier(
-        input_dim  = 512,
-        hidden_dim = cfg['hidden_dim'],
-        n_heads    = cfg['n_heads'],
-        n_layers   = cfg['n_layers'],
-        dropout    = cfg['dropout'],
-        mask_ratio = cfg.get('mask_ratio', 0.0),
+    model = HPWindowTransformer.build(
+        window_size = cfg['window_size'],
+        input_dim   = 512,
+        hidden_dim  = cfg['hidden_dim'],
+        n_heads     = cfg['n_heads'],
+        n_layers    = cfg['n_layers'],
+        dropout     = cfg['dropout'],
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -196,14 +186,15 @@ def train(cfg: dict):
         train_loss = 0.0
         current_lr = optimizer.param_groups[0]['lr']
 
-        for embeddings, labels, _, pad_mask in train_loader:
-            embeddings = embeddings.to(device)
-            labels     = labels.to(device).float()
-            pad_mask   = pad_mask.to(device)
+        for windows, win_pad_mask, pat_pad_mask, labels, _ in train_loader:
+            windows      = windows.to(device)
+            win_pad_mask = win_pad_mask.to(device)
+            pat_pad_mask = pat_pad_mask.to(device)
+            labels       = labels.to(device).float()
 
             optimizer.zero_grad()
-            logits = model(embeddings, pad_mask)
-            loss   = criterion(logits, labels)
+            logits, _ = model(windows, win_pad_mask, pat_pad_mask)
+            loss = criterion(logits, labels)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -243,14 +234,12 @@ def train(cfg: dict):
 
         if val_m['f1'] > best_val_f1:
             best_val_f1 = val_m['f1']
-
             torch.save(
                 {'epoch': epoch, 'model': model.state_dict(),
                  'val_f1': val_m['f1'], 'cfg': cfg},
                 best_ckpt,
             )
             save_predictions(val_preds_path, val_pids, val_labels, val_probs)
-
             log.info(f'  → new best saved (val_f1={val_m["f1"]:.4f})')
             wandb.run.summary['best_val_f1']    = best_val_f1
             wandb.run.summary['best_val_epoch'] = epoch
@@ -260,14 +249,11 @@ def train(cfg: dict):
     model.load_state_dict(ckpt['model'])
     vm_best, best_labels, best_probs, best_pids = evaluate(model, val_loader, device, criterion)
 
-    # PR curve — sweeps all unique predicted probabilities as thresholds (sklearn default)
     y_probas_2d = np.stack([1.0 - np.array(best_probs), np.array(best_probs)], axis=1)
-    final_pr = wandb.plot.pr_curve(
+    wandb.log({'val/final_pr_curve': wandb.plot.pr_curve(
         np.array(best_labels), y_probas_2d, labels=['negative', 'positive']
-    )
-    wandb.log({'val/final_pr_curve': final_pr})
+    )})
 
-    # ---- Save metrics.json ----
     metrics = {
         'best_epoch'   : int(ckpt['epoch']),
         'val_f1'       : float(vm_best['f1']),
@@ -283,7 +269,6 @@ def train(cfg: dict):
         json.dump(metrics, f, indent=2, default=str)
     log.info(f'Metrics: {metrics}')
 
-    # ---- Upload run artifacts ----
     artifact = wandb.Artifact(
         name=f'run-{wandb.run.name}', type='run-output', metadata=metrics
     )
@@ -301,30 +286,31 @@ def train(cfg: dict):
 if __name__ == '__main__':
     this_dir   = os.path.dirname(os.path.abspath(__file__))
     data_dir   = path_join(this_dir, 'data', 'GrastroHUN_Hpylori')
-    labels_dir = path_join(data_dir, 'yao_labels')
+    labels_dir = path_join(data_dir, 'labels')
+    feat_dir   = path_join(data_dir, 'full_seq_features')
 
     parser = argparse.ArgumentParser()
     # Paths
-    parser.add_argument('--labels_dir',    default=labels_dir)
-    parser.add_argument('--kf_dir',        default=path_join(data_dir, 'kf_features'))
-    parser.add_argument('--output_dir',    default=path_join(this_dir, 'outputs', 'transformer'))
+    parser.add_argument('--labels_dir',  default=labels_dir)
+    parser.add_argument('--feat_dir',    default=feat_dir)
+    parser.add_argument('--output_dir',  default=path_join(this_dir, 'outputs', 'window_transformer'))
     # Fold
-    parser.add_argument('--fold',          type=int, default=1, choices=[1, 2, 3])
-    # Model (sweep-able)
-    parser.add_argument('--hidden_dim',    type=int,   default=256)
-    parser.add_argument('--n_heads',       type=int,   default=4)
-    parser.add_argument('--n_layers',      type=int,   default=2)
-    parser.add_argument('--dropout',       type=float, default=0.1)
-    # Training (sweep-able)
-    parser.add_argument('--epochs',        type=int,   default=50)
-    parser.add_argument('--batch_size',    type=int,   default=32)
-    parser.add_argument('--lr',            type=float, default=1e-4)
-    parser.add_argument('--wd',            type=float, default=1e-4)
-    parser.add_argument('--num_workers',   type=int,   default=4)
-    parser.add_argument('--mask_ratio',    type=float, default=0.0,
-                        help='fraction of real frame tokens to zero during training (0 = disabled)')
+    parser.add_argument('--fold',        type=int,   default=1, choices=[1, 2, 3])
+    # Window
+    parser.add_argument('--window_size', type=int,   default=11)
+    # Classifier
+    parser.add_argument('--hidden_dim',  type=int,   default=256)
+    parser.add_argument('--n_heads',     type=int,   default=4)
+    parser.add_argument('--n_layers',    type=int,   default=2)
+    parser.add_argument('--dropout',     type=float, default=0.1)
+    # Training
+    parser.add_argument('--epochs',      type=int,   default=50)
+    parser.add_argument('--batch_size',  type=int,   default=16)
+    parser.add_argument('--lr',          type=float, default=1e-4)
+    parser.add_argument('--wd',          type=float, default=1e-4)
+    parser.add_argument('--num_workers', type=int,   default=4)
     # W&B
-    parser.add_argument('--wandb_project', default='hp-transformer')
+    parser.add_argument('--wandb_project', default='hp-window-transformer')
     parser.add_argument('--wandb_entity',  default=None)
 
     args = parser.parse_args()
@@ -332,17 +318,15 @@ if __name__ == '__main__':
     with wandb.init(
         project = args.wandb_project,
         entity  = args.wandb_entity,
-        # argparse values become wandb.config defaults; sweep agent overrides them
         config  = vars(args),
     ):
         cfg = {
-            # Fixed paths — always from argparse
             'labels_dir' : args.labels_dir,
-            'kf_dir'     : args.kf_dir,
+            'feat_dir'   : args.feat_dir,
             'output_dir' : args.output_dir,
             'num_workers': args.num_workers,
-            # Sweep-able — wandb.config so sweep values take priority
             'fold'       : wandb.config.fold,
+            'window_size': wandb.config.window_size,
             'hidden_dim' : wandb.config.hidden_dim,
             'n_heads'    : wandb.config.n_heads,
             'n_layers'   : wandb.config.n_layers,
@@ -351,6 +335,5 @@ if __name__ == '__main__':
             'batch_size' : wandb.config.batch_size,
             'lr'         : wandb.config.lr,
             'wd'         : wandb.config.wd,
-            'mask_ratio' : wandb.config.mask_ratio,
         }
         train(cfg)

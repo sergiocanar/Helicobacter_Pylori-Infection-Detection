@@ -4,11 +4,11 @@ run_cap: 30
 
 command:
   - env
-  - CUDA_VISIBLE_DEVICES=1
+  - CUDA_VISIBLE_DEVICES=7
   - python
   - ${program}
   - --fold
-  - "3"          # ← change to 2 or 3 before registering the next sweep
+  - "2"          # ← change to 2 or 3 before registering the next sweep
   - ${args}
 
 metric:
@@ -18,10 +18,7 @@ metric:
 parameters:
   # Primary comparison: ImageNet init vs HOPE-AI (LSTMModel) init
   checkpoint:
-    values:
-      - weights/model.pth                # HOPE-AI / LSTMModel pretrained
-      - weights/pvt_v2_b2.pth          # ImageNet pretrained (PVTv2-B2)
-
+    value: /home/scanar/endovis/models/Helicobacter_Pylori-Infection-Detection/Code-HOPE-AI/weights/model.pth              # HOPE-AI / LSTMModel pretrained
 
   # Learning rate — log-uniform range (bayes samples in log space)
   lr:
@@ -39,7 +36,7 @@ parameters:
   epochs:
     value: 30
   batch_size:
-    value: 32
+    value: 64
   img_size:
     value: 352
   warmup_epochs:

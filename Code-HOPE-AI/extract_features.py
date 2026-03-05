@@ -181,31 +181,35 @@ def main_finetuned_kf(frames_dir: str, labels_dir: str, ckpts_root: str,
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = path_join(this_dir, 'data', 'GrastroHUN_Hpylori')
+
     parser = argparse.ArgumentParser(description='Extract PVTv2 image embeddings')
     parser.add_argument('--mode',        choices=['vanilla', 'finetuned_kf'],
                         default='vanilla',
                         help='vanilla: single checkpoint on all.csv  |  '
                              'finetuned_kf: per-fold fine-tuned encoder')
+    parser.add_argument('--frames_dir',  default=path_join(data_dir, 'yao_images'),
+                        help='root directory of frame images')
+    parser.add_argument('--labels_dir',  default=path_join(data_dir, 'yao_labels'),
+                        help='directory containing fold CSVs  (finetuned_kf mode)')
+    parser.add_argument('--output_dir',  default=None,
+                        help='output directory for .pth files '
+                             '(default: kf_features/ or features/ under data_dir)')
     parser.add_argument('--img_size',    type=int, default=352)
-    parser.add_argument('--batch_size',  type=int, default=32)
+    parser.add_argument('--batch_size',  type=int, default=128)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--normalize',   action='store_true', default=True,
                         help='L2-normalise embeddings (default: True)')
     args = parser.parse_args()
 
-    this_dir   = os.path.dirname(os.path.abspath(__file__))
-    data_dir   = path_join(this_dir, 'data', 'GrastroHUN_Hpylori')
-    frames_dir = path_join(data_dir, 'yao_images')
-    labels_dir = path_join(data_dir, 'labels')
-
     if args.mode == 'vanilla':
         ckpt_path  = path_join(this_dir, 'weights', 'model.pth')
-        output_dir = path_join(data_dir, 'features')
+        output_dir = args.output_dir or path_join(data_dir, 'features')
         os.makedirs(output_dir, exist_ok=True)
-        main_vanilla(frames_dir, labels_dir, ckpt_path, output_dir, args)
+        main_vanilla(args.frames_dir, args.labels_dir, ckpt_path, output_dir, args)
 
     elif args.mode == 'finetuned_kf':
-        ckpts_root = path_join(this_dir, 'outputs', 'pvtv2', 'hope_ai')
-        yao_labels_dir = path_join(data_dir, 'yao_labels')
-        output_dir = path_join(data_dir, 'kf_features')
-        main_finetuned_kf(frames_dir, yao_labels_dir, ckpts_root, output_dir, args)
+        ckpts_root = path_join(this_dir, 'outputs', 'pvtv2', 'hope_ai_gastrohun')
+        output_dir = args.output_dir or path_join(data_dir, 'kf_features')
+        main_finetuned_kf(args.frames_dir, args.labels_dir, ckpts_root, output_dir, args)

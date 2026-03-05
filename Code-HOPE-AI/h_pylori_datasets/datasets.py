@@ -112,7 +112,7 @@ def bag_collate(batch):
 
 
 # ---------------------------------------------------------------------------
-# Per-patient keyframe-feature dataset (for Transformer classifier)
+# Patient keyframe dataset (pre-extracted kf embeddings, one .pth per patient)
 # ---------------------------------------------------------------------------
 
 class PatientKFDataset(Dataset):
@@ -184,6 +184,222 @@ def patient_kf_collate(batch):
     return padded, torch.tensor(labels, dtype=torch.long), list(pids), pad_mask
 
 
+# ---------------------------------------------------------------------------
+# Keyframe window dataset (for contextualised keyframe embeddings)
+# ---------------------------------------------------------------------------
+
+class KeyframeWindowDataset(Dataset):
+    """
+    For each keyframe in a fold CSV loads a fixed-size window of pre-extracted
+    frame embeddings centred on that keyframe from full_seq_features.
+
+    Each item:
+        embeddings  : Tensor [window_size, 512]   (zero-padded at boundaries)
+        label       : int  (HP 0 / 1)
+        patient_id  : int
+        kf_idx      : int  (sequential frame index of the keyframe)
+
+    Since every item has the same shape [window_size, 512], a standard
+    DataLoader with batch_size > 1 works without a custom collate.
+
+    Args:
+        csv_path        : fold CSV with columns frame_path, patient_id, HP,
+                          is_keyframe (bool).
+        features_dir    : directory containing patient_<id>.pth files whose
+                          'embeddings' tensor is [N_frames, 512] with the same
+                          sequential frame ordering as the CSV.
+        window_size     : total window width (must be odd; e.g. 5 → ±2 frames).
+    """
+
+    def __init__(self, csv_path: str, features_dir: str, window_size: int = 5):
+        assert window_size % 2 == 1, "window_size must be odd"
+        self.half = window_size // 2
+        self.window_size = window_size
+        self.features_dir = features_dir
+
+        df = pd.read_csv(csv_path)
+        kf = df[df['is_keyframe'] == True].copy()
+        kf['kf_idx'] = (
+            kf['frame_path'].str.extract(r'frame_(\d+)\.jpg')[0].astype(int)
+        )
+
+        # Store (patient_id, kf_idx, label) for each keyframe
+        self.items = [
+            (int(row['patient_id']), int(row['kf_idx']), int(row['HP']))
+            for _, row in kf.iterrows()
+        ]
+
+        # Cache: patient_id -> embeddings tensor [N, 512]
+        self._cache: dict[int, torch.Tensor] = {}
+
+    def _load(self, pid: int) -> torch.Tensor:
+        if pid not in self._cache:
+            path = os.path.join(self.features_dir, f'patient_{pid:03d}.pth')
+            data = torch.load(path, map_location='cpu', weights_only=True)
+            self._cache[pid] = data['embeddings']   # [N, 512]
+        return self._cache[pid]
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int):
+        pid, kf_idx, label = self.items[idx]
+        emb = self._load(pid)          # [N, 512]
+        N, D = emb.shape
+
+        lo = kf_idx - self.half
+        hi = kf_idx + self.half + 1    # exclusive
+
+        # Clamp to valid range and record how much padding is needed
+        pad_left  = max(0, -lo)
+        pad_right = max(0, hi - N)
+        lo_c = max(0, lo)
+        hi_c = min(N, hi)
+
+        window = emb[lo_c:hi_c]        # [valid_frames, 512]
+
+        if pad_left > 0 or pad_right > 0:
+            window = torch.cat([
+                torch.zeros(pad_left,  D),
+                window,
+                torch.zeros(pad_right, D),
+            ], dim=0)
+
+        return window, label, pid, kf_idx
+
+
+# ---------------------------------------------------------------------------
+# Patient-level window dataset (end-to-end training with WindowKFContextualizer)
+# ---------------------------------------------------------------------------
+
+class PatientWindowDataset(Dataset):
+    """
+    Patient-level dataset for end-to-end training of WindowKFContextualizer
+    + HPTransformerClassifier.
+
+    Each item is one patient. Returns:
+        windows      : Tensor [N_kf, window_size, 512]  — window of frame
+                       embeddings centred on each keyframe (zero-padded at
+                       patient boundaries)
+        win_pad_mask : BoolTensor [N_kf, window_size]   — True = zero-padded
+                       position (boundary of video)
+        label        : int  (HP 0 / 1)
+        patient_id   : int
+
+    Use patient_window_collate to stack variable-length bags into batches.
+
+    Args:
+        csv_path      : fold CSV with is_keyframe column
+        features_dir  : directory containing patient_<id>.pth files
+                        (full_seq_features/fold{k}_{split}/)
+        window_size   : odd integer, total window width per keyframe
+    """
+
+    def __init__(self, csv_path: str, features_dir: str, window_size: int = 11):
+        assert window_size % 2 == 1, "window_size must be odd"
+        self.half         = window_size // 2
+        self.window_size  = window_size
+        self.features_dir = features_dir
+
+        df = pd.read_csv(csv_path)
+        kf = df[df['is_keyframe'] == True].copy()
+        kf['kf_idx'] = (
+            kf['frame_path'].str.extract(r'frame_(\d+)\.jpg')[0].astype(int)
+        )
+
+        # Group by patient: list of (label, [kf_idx, ...])
+        self.patients = []
+        for pid, grp in kf.groupby('patient_id'):
+            self.patients.append({
+                'patient_id': int(pid),
+                'label':      int(grp['HP'].iloc[0]),
+                'kf_indices': grp['kf_idx'].tolist(),
+            })
+
+        self._cache: dict[int, torch.Tensor] = {}
+
+    def _load(self, pid: int) -> torch.Tensor:
+        if pid not in self._cache:
+            path = os.path.join(self.features_dir, f'patient_{pid:03d}.pth')
+            data = torch.load(path, map_location='cpu', weights_only=True)
+            self._cache[pid] = data['embeddings']   # [N_frames, 512]
+        return self._cache[pid]
+
+    def _window(self, emb: torch.Tensor, kf_idx: int):
+        N, D = emb.shape
+        lo, hi    = kf_idx - self.half, kf_idx + self.half + 1
+        pad_left  = max(0, -lo)
+        pad_right = max(0, hi - N)
+        lo_c, hi_c = max(0, lo), min(N, hi)
+        window = emb[lo_c:hi_c]
+        if pad_left > 0 or pad_right > 0:
+            window = torch.cat([
+                torch.zeros(pad_left,  D),
+                window,
+                torch.zeros(pad_right, D),
+            ], dim=0)
+        mask = torch.zeros(self.window_size, dtype=torch.bool)
+        if pad_left  > 0: mask[:pad_left]  = True
+        if pad_right > 0: mask[-pad_right:] = True
+        return window, mask   # [W, 512], [W]
+
+    def __len__(self) -> int:
+        return len(self.patients)
+
+    def __getitem__(self, idx: int):
+        p   = self.patients[idx]
+        emb = self._load(p['patient_id'])
+
+        windows, masks = [], []
+        for kf_idx in p['kf_indices']:
+            w, m = self._window(emb, kf_idx)
+            windows.append(w)
+            masks.append(m)
+
+        return (
+            torch.stack(windows),          # [N_kf, W, 512]
+            torch.stack(masks),            # [N_kf, W]
+            p['label'],
+            p['patient_id'],
+        )
+
+
+def patient_window_collate(batch):
+    """
+    Collate for PatientWindowDataset.  Pads N_kf to the longest bag in the
+    batch and returns a patient-level padding mask.
+
+    Returns:
+        windows      : [B, max_N, W, 512]
+        win_pad_mask : [B, max_N, W]       True = zero-padded window frame
+        pat_pad_mask : [B, max_N]          True = padded patient slot
+        labels       : [B]  long
+        pids         : list[int]
+    """
+    windows_list, wmask_list, labels, pids = zip(*batch)
+    max_n = max(w.shape[0] for w in windows_list)
+    W, D  = windows_list[0].shape[1], windows_list[0].shape[2]
+    B     = len(batch)
+
+    windows      = torch.zeros(B, max_n, W, D)
+    win_pad_mask = torch.ones(B,  max_n, W, dtype=torch.bool)   # True = padded
+    pat_pad_mask = torch.ones(B,  max_n,    dtype=torch.bool)
+
+    for i, (w, m) in enumerate(zip(windows_list, wmask_list)):
+        n = w.shape[0]
+        windows[i, :n]       = w
+        win_pad_mask[i, :n]  = m
+        pat_pad_mask[i, :n]  = False   # real keyframes
+
+    return (
+        windows,
+        win_pad_mask,
+        pat_pad_mask,
+        torch.tensor(labels, dtype=torch.long),
+        list(pids),
+    )
+
+
 class YaoFrameDataset(Dataset):
     """Frame-level dataset from Yao H. Pylori CSV splits.
 
@@ -216,42 +432,30 @@ class YaoFrameDataset(Dataset):
 
 if __name__ == '__main__':
 
-    this_dir    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    frames_root = os.path.join(this_dir, 'data', 'GrastroHUN_Hpylori', 'frames')
-    labels_root = os.path.join(this_dir, 'data', 'GrastroHUN_Hpylori', 'labels')
+    this_dir     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    labels_root  = os.path.join(this_dir, 'data', 'GrastroHUN_Hpylori', 'labels')
+    features_dir = os.path.join(this_dir, 'data', 'GrastroHUN_Hpylori',
+                                'full_seq_features', 'fold1_val')
 
-    for fold in [1, 2, 3]:
-        for split in ['train', 'val']:
-            csv_path = os.path.join(labels_root, f'fold{fold}_{split}.csv')
-            ds = BagDataset(csv_path, frames_root, img_size=352)
+    print('--- KeyframeWindowDataset checker ---')
+    ds = KeyframeWindowDataset(
+        csv_path=os.path.join(labels_root, 'fold1_val.csv'),
+        features_dir=features_dir,
+        window_size=11,
+    )
+    print(f'Keyframes: {len(ds)}')
 
-            labels      = [b['label'] for b in ds.bags]
-            n_pos       = sum(labels)
-            n_neg       = len(labels) - n_pos
-            frame_counts = [len(b['frame_paths']) for b in ds.bags]
+    # Sample a few windows and print stats
+    for i in [0, len(ds)//2, len(ds)-1]:
+        window, label, pid, kf_idx = ds[i]
+        pad_left  = (window == 0).all(dim=1).cumsum(0).argmin().item()
+        pad_right = (window == 0).all(dim=1).flip(0).cumsum(0).argmin().item()
+        print(f'  [{i:4d}] patient={pid:3d}  kf_idx={kf_idx:5d}  '
+              f'label={label}  shape={tuple(window.shape)}  '
+              f'pad=({pad_left},{pad_right})')
 
-            print(f"fold{fold} {split:5s} | bags: {len(ds):3d} "
-                  f"| pos: {n_pos:3d}  neg: {n_neg:3d} "
-                  f"| frames/bag  min:{min(frame_counts):5d}  "
-                  f"max:{max(frame_counts):5d}  "
-                  f"avg:{sum(frame_counts)//len(frame_counts):5d}")
-
-    # --- DataLoader round-trip: load first bag of fold1 train and check tensor ---
-    print("\n--- DataLoader sanity check (fold 1 train, first bag) ---")
-    csv_path = os.path.join(labels_root, 'fold1_train.csv')
-    ds       = BagDataset(csv_path, frames_root, img_size=352)
-    loader   = DataLoader(ds, batch_size=1, shuffle=False, collate_fn=bag_collate)
-
-    bag_tensor, label, pid = next(iter(loader))
-
-    assert bag_tensor.ndim == 4,          "expected [N, 3, H, W]"
-    assert bag_tensor.shape[1] == 3,      "expected 3 colour channels"
-    assert bag_tensor.shape[2:] == (352, 352), "expected spatial size 352x352"
-    assert label.dtype == torch.long,     "label should be long"
-    assert label.shape == torch.Size([]), "label should be scalar"
-
-    print(f"  patient_id : {pid}")
-    print(f"  bag shape  : {tuple(bag_tensor.shape)}   (frames x C x H x W)")
-    print(f"  label      : {label.item()}  (0=neg, 1=pos)")
-    print(f"  pixel range: [{bag_tensor.min():.3f}, {bag_tensor.max():.3f}]")
-    print("All checks passed.")
+    # Batch test
+    loader = DataLoader(ds, batch_size=16, shuffle=False)
+    batch = next(iter(loader))
+    print(f'Batch shape: {tuple(batch[0].shape)}')
+    print('All checks passed.')
