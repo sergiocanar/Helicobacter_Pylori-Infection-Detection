@@ -18,7 +18,7 @@ from h_pylori_datasets import BagDataset, bag_collate
 def train_one_epoch(model, center_loss, center_loss_img,
                     loader, optimizer, optimizer_center,
                     criterion, device,
-                    topk=7, chunk_size=40, center_weight=0.001):
+                    topk=7, center_weight=0.001):
     model.train()
     center_loss.train()
     center_loss_img.train()
@@ -31,62 +31,36 @@ def train_one_epoch(model, center_loss, center_loss_img,
     for bag_tensor, label, _ in pbar:
         # bag_tensor: [N, 3, H, W]  (N varies per patient)
         # label:      scalar long tensor
-        bag_tensor = bag_tensor.to(device)
+        bag_tensor   = bag_tensor.to(device)
         label_tensor = label.unsqueeze(0).to(device)   # [1]
         N = bag_tensor.shape[0]
-        num_chunks = (N + chunk_size - 1) // chunk_size
 
         optimizer.zero_grad()
         optimizer_center.zero_grad()
 
-        # ---- Phase 1: instance loss over ALL frames + collect softmax for ranking ----
-        # Each chunk's graph is freed after its own backward() call, so memory stays
-        # bounded regardless of bag size. Gradients accumulate in model parameters.
-        all_softmax = []
-        inst_loss_total = 0.0
+        # ---- Phase 1: instance loss over ALL frames + softmax scores for ranking ----
+        _, x_logits_all, x_softmax_all = model(bag_tensor.unsqueeze(0), is_train=False)
+        # x_logits_all: [1, N, 2],  x_softmax_all: [1, N, 2]
+        loss_inst = 0.5 * criterion(x_logits_all.squeeze(0), label_tensor.expand(N))
 
-        for i in range(0, N, chunk_size):
-            chunk = bag_tensor[i:i + chunk_size].unsqueeze(0)   # [1, c, 3, H, W]
-            c = chunk.shape[1]
-
-            _, x_logits_chunk, x_softmax_chunk = model(chunk, is_train=False)
-            # x_logits_chunk: [1, c, 2],  x_softmax_chunk: [1, c, 2]
-
-            # Instance CE/Focal loss — scale by 1/num_chunks so the total
-            # instance gradient weight equals 0.5 * loss_inst (as before)
-            loss_chunk = 0.5 * criterion(
-                x_logits_chunk.squeeze(0),          # [c, 2]
-                label_tensor.expand(c),             # [c]
-            ) / num_chunks
-            loss_chunk.backward()                   # accumulate grads; graph freed
-
-            all_softmax.append(x_softmax_chunk.detach().squeeze(0))  # [c, 2]
-            inst_loss_total += loss_chunk.item()
-
-        all_softmax = torch.cat(all_softmax, dim=0)     # [N, 2]
-
-        # ---- Top-k selection (on detached scores — no grad needed here) ----
+        # ---- Top-k selection (detached — no grad through selection) ----
         topk_k = min(N, topk)
-        topk_indices = torch.topk(all_softmax[:, 1], topk_k)[1]
+        topk_indices = torch.topk(x_softmax_all.detach().squeeze(0)[:, 1], topk_k)[1]
         topk_imgs = bag_tensor[topk_indices]            # [k, 3, H, W]
 
-        # ---- Phase 2: LSTM bag-level pass on top-k (grad accumulates further) ----
+        # ---- Phase 2: LSTM bag-level pass on top-k ----
         # img_feat:  [1, k, 512]  (normalized image features)
-        # x_logits:  [1, k, 2]   (per-frame logits)
         # bag_feat:  [1, 256]    (normalized LSTM bag feature)
         # bag_out:   [1, 2]      (bag-level logits)
-        img_feat, x_logits, bag_feat, bag_out = model(
-            topk_imgs.unsqueeze(0), is_train=True
-        )
-
+        img_feat, _, bag_feat, bag_out = model(topk_imgs.unsqueeze(0), is_train=True)
         topk_labels = label_tensor.expand(topk_k)      # [k]
 
         loss_bag        = criterion(bag_out, label_tensor)
-        loss_center_bag = center_loss(bag_feat, label_tensor)          * center_weight
-        loss_center_img = center_loss_img(img_feat.squeeze(0), topk_labels) * center_weight
+        loss_center_bag = center_loss(bag_feat, label_tensor)                   * center_weight
+        loss_center_img = center_loss_img(img_feat.squeeze(0), topk_labels)     * center_weight
 
-        loss_phase2 = loss_bag + loss_center_bag + loss_center_img
-        loss_phase2.backward()
+        loss = loss_inst + loss_bag + loss_center_bag + loss_center_img
+        loss.backward()
 
         optimizer.step()
 
@@ -97,10 +71,9 @@ def train_one_epoch(model, center_loss, center_loss_img,
             param.grad.data *= (1.0 / center_weight)
         optimizer_center.step()
 
-        total_bag_loss = inst_loss_total + loss_phase2.item()
         pred = bag_out.argmax(dim=1)
         correct    += (pred == label_tensor).sum().item()
-        total_loss += total_bag_loss
+        total_loss += loss.item()
         n_bags     += 1
 
         pbar.set_postfix(loss=f'{total_loss/n_bags:.4f}', acc=f'{correct/n_bags:.4f}')
@@ -111,7 +84,7 @@ def train_one_epoch(model, center_loss, center_loss_img,
 @torch.no_grad()
 def validate(model, center_loss, center_loss_img,
              loader, criterion, device,
-             topk=7, chunk_size=40, center_weight=0.001):
+             topk=7, center_weight=0.001):
     model.eval()
     center_loss.eval()
     center_loss_img.eval()
@@ -126,31 +99,24 @@ def validate(model, center_loss, center_loss_img,
         label_tensor = label.unsqueeze(0).to(device)
         N = bag_tensor.shape[0]
 
-        # Phase 1: all frames → top-k
-        all_softmax = []
-        for i in range(0, N, chunk_size):
-            chunk = bag_tensor[i:i + chunk_size].unsqueeze(0)
-            _, _, x_softmax = model(chunk, is_train=False)
-            all_softmax.append(x_softmax.squeeze(0))
-        all_softmax = torch.cat(all_softmax, dim=0)
+        # Phase 1: all frames → softmax scores for ranking
+        _, x_logits_all, x_softmax_all = model(bag_tensor.unsqueeze(0), is_train=False)
+        loss_inst = 0.5 * criterion(x_logits_all.squeeze(0), label_tensor.expand(N))
 
+        # Top-k selection
         topk_k = min(N, topk)
-        topk_indices = torch.topk(all_softmax[:, 1], topk_k)[1]
+        topk_indices = torch.topk(x_softmax_all.squeeze(0)[:, 1], topk_k)[1]
         topk_imgs = bag_tensor[topk_indices]
 
         # Phase 2: LSTM bag prediction
-        img_feat, x_logits, bag_feat, bag_out = model(
-            topk_imgs.unsqueeze(0), is_train=True
-        )
-
+        img_feat, _, bag_feat, bag_out = model(topk_imgs.unsqueeze(0), is_train=True)
         topk_labels = label_tensor.expand(topk_k)
 
         loss_bag        = criterion(bag_out, label_tensor)
-        loss_inst       = criterion(x_logits.squeeze(0), topk_labels)
-        loss_center_bag = center_loss(bag_feat, label_tensor)     * center_weight
-        loss_center_img = center_loss_img(img_feat.squeeze(0), topk_labels) * center_weight
+        loss_center_bag = center_loss(bag_feat, label_tensor)                   * center_weight
+        loss_center_img = center_loss_img(img_feat.squeeze(0), topk_labels)     * center_weight
 
-        loss = loss_bag + 0.5 * loss_inst + loss_center_bag + loss_center_img
+        loss = loss_inst + loss_bag + loss_center_bag + loss_center_img
 
         pred = bag_out.argmax(dim=1)
         correct    += (pred == label_tensor).sum().item()
@@ -180,12 +146,10 @@ if __name__ == '__main__':
     parser.add_argument('--topk',         type=int,   default=7,
                         help='Number of top-scoring frames used for LSTM')
     parser.add_argument('--img_size',     type=int,   default=352)
-    parser.add_argument('--chunk_size',   type=int,   default=40,
-                        help='Frames processed per forward chunk (Phase 1)')
     parser.add_argument('--num_workers',  type=int,   default=4,
                         help='DataLoader workers (0 = main process)')
     parser.add_argument('--save_dir',     type=str,   default='checkpoints')
-    parser.add_argument('--pretrained',  action='store_true',
+    parser.add_argument('--pretrained',   action='store_true',
                         help='Load author weights from weights/ before training')
     args = parser.parse_args()
 
@@ -259,14 +223,12 @@ if __name__ == '__main__':
             model, model_center_loss, model_center_loss_img,
             train_loader, optimizer, optimizer_center,
             criterion, device,
-            topk=args.topk, chunk_size=args.chunk_size,
-            center_weight=args.center_weight,
+            topk=args.topk, center_weight=args.center_weight,
         )
         val_loss, val_acc = validate(
             model, model_center_loss, model_center_loss_img,
             val_loader, criterion, device,
-            topk=args.topk, chunk_size=args.chunk_size,
-            center_weight=args.center_weight,
+            topk=args.topk, center_weight=args.center_weight,
         )
         scheduler.step()
 
