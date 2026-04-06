@@ -10,9 +10,9 @@ class FocalLoss(nn.Module):
         self.weight = weight
 
     def forward(self, inputs, targets):
-        ce_loss = nn.CrossEntropyLoss(weight=self.weight)(inputs, targets)  # 使用交叉熵损失函数计算基础损失
-        pt = torch.exp(-ce_loss)  # 计算预测的概率
-        focal_loss = (1 - pt) ** self.gamma * ce_loss  # 根据Focal Loss公式计算Focal Loss
+        ce_loss = F.cross_entropy(inputs, targets, weight=self.weight, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma * ce_loss).mean()
         return focal_loss
 
 class CenterLoss(nn.Module):
@@ -31,8 +31,7 @@ class CenterLoss(nn.Module):
         self.num_classes = num_classes
         self.feat_dim  = feat_dim
 
-        center_init = torch.zeros(self.num_classes, self.feat_dim).cuda()
-
+        center_init = torch.zeros(self.num_classes, self.feat_dim)
         nn.init.xavier_uniform_(center_init)
         self.centers = nn.Parameter(center_init)
 
@@ -49,8 +48,7 @@ class CenterLoss(nn.Module):
                   torch.pow(self.centers, 2).sum(dim=1, keepdim=True).expand(self.num_classes, batch_size).t()
         distmat.addmm_(x, self.centers.t(), beta=1, alpha=-2)
 
-        classes = torch.arange(self.num_classes).long() # should be long()
-        classes = classes.cuda()
+        classes = torch.arange(self.num_classes).long().to(x.device)
         labels = labels.unsqueeze(1).expand(batch_size, self.num_classes)
         mask   = labels.eq(classes.expand(batch_size, self.num_classes))
         if class_weight is not None:
